@@ -11,6 +11,7 @@ MSK = timezone(timedelta(hours=3))
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -326,10 +327,7 @@ class GVGView(discord.ui.View):
             return
 
         user_id = str(interaction.user.id)
-
-        if user_id in all_signed_ids(raid):
-            await interaction.response.send_message("Ты уже записан. Сначала отписывайся.", ephemeral=True)
-            return
+        position = find_user_position(raid, user_id)
 
         current = raid["teams"][team][role]
         limit = TEAM_LIMITS[team][role]
@@ -338,20 +336,41 @@ class GVGView(discord.ui.View):
             await interaction.response.send_message("Этот слот уже заполнен.", ephemeral=True)
             return
 
+        moved_from_reserve_role = None
+
+        if position:
+            if position[0] == "reserve":
+                _, _, old_reserve_role = position
+                raid["reserve"][old_reserve_role].remove(user_id)
+                moved_from_reserve_role = old_reserve_role
+            else:
+                await interaction.response.send_message(
+                    "Ты уже записан в атаку/защиту. Чтобы сменить команду или роль, сначала отписывайся.",
+                    ephemeral=True
+                )
+                return
+
         current.append(user_id)
         save_data(data)
         await refresh_raid_message(self.raid_id)
 
-        await send_raid_thread_message(
-            raid,
-            f"➕ {interaction.user.mention} записался в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
-        )
+        if moved_from_reserve_role:
+            await send_raid_thread_message(
+                raid,
+                f"⬆️ {interaction.user.mention} перешёл из резерва ({ROLE_NAMES[moved_from_reserve_role]}) "
+                f"в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
+            )
+            response_text = f"Ты переведён из резерва: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}"
+        else:
+            await send_raid_thread_message(
+                raid,
+                f"➕ {interaction.user.mention} записался в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
+            )
+            response_text = f"Ты записан: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}"
+
         await announce_full_if_needed(self.raid_id)
 
-        await interaction.response.send_message(
-            f"Ты записан: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}",
-            ephemeral=True
-        )
+        await interaction.response.send_message(response_text, ephemeral=True)
 
     async def add_to_reserve(self, interaction: discord.Interaction, role: str):
         raid = data.get(self.raid_id)
