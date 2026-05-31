@@ -313,6 +313,16 @@ class GVGView(discord.ui.View):
         super().__init__(timeout=None)
         self.raid_id = raid_id
 
+    def format_position_short(self, position) -> str:
+        if not position:
+            return "не был записан"
+
+        place, team, role = position
+        if place == "reserve":
+            return f"резерв / {ROLE_NAMES[role]}"
+
+        return f"{TEAM_NAMES[team]} / {ROLE_NAMES[role]}"
+
     async def add_to_team(self, interaction: discord.Interaction, team: str, role: str):
         raid = data.get(self.raid_id)
         if not raid:
@@ -327,50 +337,63 @@ class GVGView(discord.ui.View):
             return
 
         user_id = str(interaction.user.id)
-        position = find_user_position(raid, user_id)
+        old_position = find_user_position(raid, user_id)
 
-        current = raid["teams"][team][role]
-        limit = TEAM_LIMITS[team][role]
+        if old_position == ("team", team, role):
+            await interaction.response.send_message(
+                f"Ты уже записан здесь: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}",
+                ephemeral=True
+            )
+            return
 
-        if len(current) >= limit:
+        if len(raid["teams"][team][role]) >= TEAM_LIMITS[team][role]:
             await interaction.response.send_message("Этот слот уже заполнен.", ephemeral=True)
             return
 
-        moved_from_reserve_role = None
+        removed_pos = None
+        moved_user_id = None
+        moved_team = None
+        moved_role = None
 
-        if position:
-            if position[0] == "reserve":
-                _, _, old_reserve_role = position
-                raid["reserve"][old_reserve_role].remove(user_id)
-                moved_from_reserve_role = old_reserve_role
-            else:
-                await interaction.response.send_message(
-                    "Ты уже записан в атаку/защиту. Чтобы сменить команду или роль, сначала отписывайся.",
-                    ephemeral=True
-                )
-                return
+        if old_position:
+            removed_pos = remove_user_from_raid(raid, user_id)
 
-        current.append(user_id)
+            # Если игрок ушёл из атаки/защиты, на его старое место автоматически
+            # поднимаем первого человека из резерва той же роли.
+            if removed_pos and removed_pos[0] == "team":
+                _, old_team, old_role = removed_pos
+                moved_user_id = try_move_from_reserve(raid, old_team, old_role)
+                moved_team = old_team
+                moved_role = old_role
+
+        raid["teams"][team][role].append(user_id)
         save_data(data)
         await refresh_raid_message(self.raid_id)
 
-        if moved_from_reserve_role:
+        if old_position:
             await send_raid_thread_message(
                 raid,
-                f"⬆️ {interaction.user.mention} перешёл из резерва ({ROLE_NAMES[moved_from_reserve_role]}) "
-                f"в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
+                f"🔄 {interaction.user.mention} сменил запись: "
+                f"{self.format_position_short(old_position)} → {TEAM_NAMES[team]} / {ROLE_NAMES[role]}."
             )
-            response_text = f"Ты переведён из резерва: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}"
         else:
             await send_raid_thread_message(
                 raid,
                 f"➕ {interaction.user.mention} записался в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
             )
-            response_text = f"Ты записан: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}"
+
+        if moved_user_id:
+            await send_raid_thread_message(
+                raid,
+                f"⬆️ Из резерва поднят <@{moved_user_id}> в {TEAM_NAMES[moved_team]} как {ROLE_NAMES[moved_role]}."
+            )
 
         await announce_full_if_needed(self.raid_id)
 
-        await interaction.response.send_message(response_text, ephemeral=True)
+        await interaction.response.send_message(
+            f"Готово: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}",
+            ephemeral=True
+        )
 
     async def add_to_reserve(self, interaction: discord.Interaction, role: str):
         raid = data.get(self.raid_id)
@@ -386,26 +409,60 @@ class GVGView(discord.ui.View):
             return
 
         user_id = str(interaction.user.id)
+        old_position = find_user_position(raid, user_id)
 
-        if user_id in all_signed_ids(raid):
-            await interaction.response.send_message("Ты уже записан. Сначала отписывайся.", ephemeral=True)
+        if old_position == ("reserve", None, role):
+            await interaction.response.send_message(
+                f"Ты уже записан здесь: резерв / {ROLE_NAMES[role]}",
+                ephemeral=True
+            )
             return
 
         if len(raid["reserve"][role]) >= RESERVE_LIMITS[role]:
             await interaction.response.send_message("Резерв на эту роль уже заполнен.", ephemeral=True)
             return
 
+        moved_user_id = None
+        moved_team = None
+        moved_role = None
+
+        if old_position:
+            removed_pos = remove_user_from_raid(raid, user_id)
+
+            # Если игрок перешёл из атаки/защиты в резерв, на его старое место
+            # автоматически поднимаем первого человека из резерва той же роли.
+            if removed_pos and removed_pos[0] == "team":
+                _, old_team, old_role = removed_pos
+                moved_user_id = try_move_from_reserve(raid, old_team, old_role)
+                moved_team = old_team
+                moved_role = old_role
+
         raid["reserve"][role].append(user_id)
         save_data(data)
         await refresh_raid_message(self.raid_id)
 
-        await send_raid_thread_message(
-            raid,
-            f"➕ {interaction.user.mention} записался в резерв как {ROLE_NAMES[role]}."
-        )
+        if old_position:
+            await send_raid_thread_message(
+                raid,
+                f"🔄 {interaction.user.mention} сменил запись: "
+                f"{self.format_position_short(old_position)} → резерв / {ROLE_NAMES[role]}."
+            )
+        else:
+            await send_raid_thread_message(
+                raid,
+                f"➕ {interaction.user.mention} записался в резерв как {ROLE_NAMES[role]}."
+            )
+
+        if moved_user_id:
+            await send_raid_thread_message(
+                raid,
+                f"⬆️ Из резерва поднят <@{moved_user_id}> в {TEAM_NAMES[moved_team]} как {ROLE_NAMES[moved_role]}."
+            )
+
+        await announce_full_if_needed(self.raid_id)
 
         await interaction.response.send_message(
-            f"Ты записан в резерв: {ROLE_NAMES[role]}",
+            f"Готово: резерв / {ROLE_NAMES[role]}",
             ephemeral=True
         )
 
