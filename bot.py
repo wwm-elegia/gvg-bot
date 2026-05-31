@@ -41,6 +41,10 @@ RESERVE_LIMITS = {
     "dps": 10,
 }
 
+# Через сколько секунд после начала ГВГ удалять запись.
+# 7200 секунд = 2 часа.
+AUTO_DELETE_AFTER_SECONDS = 2 * 60 * 60
+
 TEAM_NAMES = {
     "attack": "Команда Атаки",
     "defense": "Команда Защиты",
@@ -137,6 +141,24 @@ def reserve_total(reserve_data: dict) -> int:
     return sum(len(reserve_data[role]) for role in ("tank", "heal", "dps"))
 
 
+def raid_has_started(raid: dict) -> bool:
+    return int(datetime.now(timezone.utc).timestamp()) >= int(raid["time"])
+
+
+def set_view_disabled(view: discord.ui.View):
+    for item in view.children:
+        if isinstance(item, discord.ui.Button):
+            item.disabled = True
+
+
+def make_gvg_view(raid_id: str, raid: dict | None = None) -> "GVGView":
+    raid = raid or data.get(raid_id)
+    view = GVGView(raid_id)
+    if raid and raid_has_started(raid):
+        set_view_disabled(view)
+    return view
+
+
 def build_raid_message(raid_id: str) -> str:
     raid = data[raid_id]
     normalize_raid(raid)
@@ -147,9 +169,19 @@ def build_raid_message(raid_id: str) -> str:
     defense = raid["teams"]["defense"]
     reserve = raid["reserve"]
 
+    status = "🔒 **Запись закрыта: ГВГ уже началось.**" if raid_has_started(raid) else "🟢 **Запись открыта.**"
+    full_status = "✅ **Состав ГВГ собран: 30/30.**" if is_gvg_full(raid) else None
+
     lines = [
         f"## {raid['title']}",
         f"🕒 **По МСК:** {raid['date_msk']} {raid['time_msk']}  **(локальное: <t:{timestamp}:F>)**",
+        status,
+    ]
+
+    if full_status:
+        lines.append(full_status)
+
+    lines += [
         "",
         f"**Команда Атаки** — {team_total(attack)}/15",
         f"🛡️ Танки ({len(attack['tank'])}/2)",
@@ -192,7 +224,87 @@ async def refresh_raid_message(raid_id: str):
     except discord.NotFound:
         return
 
-    await message.edit(content=build_raid_message(raid_id), view=GVGView(raid_id))
+    await message.edit(content=build_raid_message(raid_id), view=make_gvg_view(raid_id, raid))
+
+
+
+
+async def send_raid_thread_message(raid: dict, text: str):
+    thread_id = raid.get("thread_id")
+    if not thread_id:
+        return
+
+    thread = bot.get_channel(thread_id)
+    if thread is None:
+        channel = bot.get_channel(raid.get("channel_id"))
+        if channel is not None:
+            try:
+                thread = await channel.guild.fetch_channel(thread_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                thread = None
+
+    if thread is not None:
+        try:
+            await thread.send(text)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"Не удалось отправить сообщение в ветку ГВГ: {e}")
+
+
+def is_gvg_full(raid: dict) -> bool:
+    normalize_raid(raid)
+    return (
+        team_total(raid["teams"]["attack"]) == 15
+        and team_total(raid["teams"]["defense"]) == 15
+    )
+
+
+async def announce_full_if_needed(raid_id: str):
+    raid = data.get(raid_id)
+    if not raid:
+        return
+
+    if is_gvg_full(raid) and not raid.get("full_announced", False):
+        raid["full_announced"] = True
+        save_data(data)
+        await send_raid_thread_message(raid, "✅ **Состав ГВГ собран: 30/30.**")
+    elif not is_gvg_full(raid) and raid.get("full_announced", False):
+        raid["full_announced"] = False
+        save_data(data)
+
+
+async def delete_raid_after_gvg(raid_id: str):
+    raid = data.get(raid_id)
+    if not raid:
+        return
+
+    channel = bot.get_channel(raid["channel_id"])
+
+    # Сначала пробуем удалить ветку обсуждения, если она была создана.
+    thread_id = raid.get("thread_id")
+    if thread_id:
+        thread = bot.get_channel(thread_id)
+        if thread is None and channel is not None:
+            try:
+                thread = await channel.guild.fetch_channel(thread_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                thread = None
+
+        if thread is not None:
+            try:
+                await thread.delete(reason="Автоудаление записи ГВГ через 2 часа после начала")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                print(f"Не удалось удалить ветку ГВГ {raid_id}: {e}")
+
+    # Потом удаляем само сообщение записи.
+    if channel is not None and raid.get("message_id"):
+        try:
+            message = await channel.fetch_message(raid["message_id"])
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"Не удалось удалить сообщение ГВГ {raid_id}: {e}")
+
+    data.pop(raid_id, None)
+    save_data(data)
 
 
 class GVGView(discord.ui.View):
@@ -207,6 +319,11 @@ class GVGView(discord.ui.View):
             return
 
         normalize_raid(raid)
+
+        if raid_has_started(raid):
+            await interaction.response.send_message("Запись уже закрыта: ГВГ началось.", ephemeral=True)
+            await refresh_raid_message(self.raid_id)
+            return
 
         user_id = str(interaction.user.id)
 
@@ -225,6 +342,12 @@ class GVGView(discord.ui.View):
         save_data(data)
         await refresh_raid_message(self.raid_id)
 
+        await send_raid_thread_message(
+            raid,
+            f"➕ {interaction.user.mention} записался в {TEAM_NAMES[team]} как {ROLE_NAMES[role]}."
+        )
+        await announce_full_if_needed(self.raid_id)
+
         await interaction.response.send_message(
             f"Ты записан: {TEAM_NAMES[team]} / {ROLE_NAMES[role]}",
             ephemeral=True
@@ -237,6 +360,11 @@ class GVGView(discord.ui.View):
             return
 
         normalize_raid(raid)
+
+        if raid_has_started(raid):
+            await interaction.response.send_message("Запись уже закрыта: ГВГ началось.", ephemeral=True)
+            await refresh_raid_message(self.raid_id)
+            return
 
         user_id = str(interaction.user.id)
 
@@ -251,6 +379,11 @@ class GVGView(discord.ui.View):
         raid["reserve"][role].append(user_id)
         save_data(data)
         await refresh_raid_message(self.raid_id)
+
+        await send_raid_thread_message(
+            raid,
+            f"➕ {interaction.user.mention} записался в резерв как {ROLE_NAMES[role]}."
+        )
 
         await interaction.response.send_message(
             f"Ты записан в резерв: {ROLE_NAMES[role]}",
@@ -302,6 +435,14 @@ class GVGView(discord.ui.View):
 
         normalize_raid(raid)
 
+        if raid_has_started(raid):
+            await interaction.response.send_message(
+                "Отписаться уже нельзя: ГВГ началось.",
+                ephemeral=True
+            )
+            await refresh_raid_message(self.raid_id)
+            return
+
         user_id = str(interaction.user.id)
         removed_pos = remove_user_from_raid(raid, user_id)
 
@@ -321,6 +462,28 @@ class GVGView(discord.ui.View):
 
         save_data(data)
         await refresh_raid_message(self.raid_id)
+
+        if moved_user_id:
+            await send_raid_thread_message(
+                raid,
+                f"➖ {interaction.user.mention} отписался. "
+                f"Из резерва поднят <@{moved_user_id}> в {TEAM_NAMES[moved_team]} как {ROLE_NAMES[moved_role]}."
+            )
+        else:
+            if removed_pos[0] == "team":
+                _, old_team, old_role = removed_pos
+                await send_raid_thread_message(
+                    raid,
+                    f"➖ {interaction.user.mention} отписался из {TEAM_NAMES[old_team]} как {ROLE_NAMES[old_role]}."
+                )
+            else:
+                _, _, old_role = removed_pos
+                await send_raid_thread_message(
+                    raid,
+                    f"➖ {interaction.user.mention} отписался из резерва как {ROLE_NAMES[old_role]}."
+                )
+
+        await announce_full_if_needed(self.raid_id)
 
         if moved_user_id:
             await interaction.response.send_message(
@@ -373,6 +536,7 @@ async def gvg_create(interaction: discord.Interaction, title: str, date: str, ti
         "channel_id": interaction.channel.id,
         "message_id": None,
         "thread_id": None,
+        "full_announced": False,
         "teams": {
             "attack": {"tank": [], "heal": [], "dps": []},
             "defense": {"tank": [], "heal": [], "dps": []},
@@ -408,9 +572,15 @@ async def gvg_create(interaction: discord.Interaction, title: str, date: str, ti
 async def reminder_loop():
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
-    for raid_id, raid in data.items():
+    # list(data.items()) нужен, потому что во время цикла рейд может удалиться из data.
+    for raid_id, raid in list(data.items()):
         normalize_raid(raid)
-        raid_time = raid["time"]
+        raid_time = int(raid["time"])
+
+        # Автоудаление записи через 2 часа после начала ГВГ.
+        if now_ts >= raid_time + AUTO_DELETE_AFTER_SECONDS:
+            await delete_raid_after_gvg(raid_id)
+            continue
 
         reminders = [
             (3600, "ГВГ через 1 час"),
@@ -418,25 +588,32 @@ async def reminder_loop():
             (0, "ГВГ началось"),
         ]
 
-        all_ids = sorted(all_signed_ids(raid))
-        if not all_ids:
-            continue
-
-        mentions = " ".join(f"<@{uid}>" for uid in all_ids)
         channel = bot.get_channel(raid["channel_id"])
         if channel is None:
             continue
 
+        all_ids = sorted(all_signed_ids(raid))
+        mentions = " ".join(f"<@{uid}>" for uid in all_ids)
+
         for seconds_before, text in reminders:
             key = str(seconds_before)
+            raid.setdefault("reminders_sent", {})
+
             if raid["reminders_sent"].get(key):
                 continue
 
             if now_ts >= raid_time - seconds_before:
                 try:
-                    await channel.send(f"{mentions}\n**{raid['title']}** — {text}")
+                    if mentions:
+                        await channel.send(f"{mentions}\n**{raid['title']}** — {text}")
+                    else:
+                        await channel.send(f"**{raid['title']}** — {text}")
+
                     raid["reminders_sent"][key] = True
                     save_data(data)
+
+                    if seconds_before == 0:
+                        await refresh_raid_message(raid_id)
                 except Exception as e:
                     print(f"Ошибка напоминания {raid_id}: {e}")
 
